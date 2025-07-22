@@ -1,5 +1,4 @@
 use proc_macro::TokenStream;
-use proc_macro2::TokenTree;
 use quote::{format_ident, quote};
 use std::collections::BTreeMap;
 use syn::{
@@ -46,20 +45,19 @@ impl CanisterVisitor {
                 self.commits
                     .insert(func.sig.ident.to_string(), func.sig.ident.to_string());
             } else if exp.len() == 1 {
-                if let TokenTree::Literal(lit) = &exp[0] {
+                if let proc_macro2::TokenTree::Literal(lit) = &exp[0] {
                     let action = lit.to_string().replace('"', "");
                     self.commits.insert(action, func.sig.ident.to_string());
                 } else {
                     panic!("Expected #[commit(\"...\")] attribute");
                 }
             } else if exp.len() == 3 {
-                let b0 = matches!(exp[0].clone(), TokenTree::Ident(ident) if ident.to_string() == "action");
-                let b1 =
-                    matches!(exp[1].clone(), TokenTree::Punct(punct) if punct.as_char() == '=');
+                let b0 = matches!(exp[0].clone(), proc_macro2::TokenTree::Ident(ident) if ident.to_string() == "action");
+                let b1 = matches!(exp[1].clone(), proc_macro2::TokenTree::Punct(punct) if punct.as_char() == '=');
                 if !(b0 && b1) {
                     panic!("Expected #[commit(action = \"...\")] attribute");
                 }
-                if let TokenTree::Literal(lit) = &exp[2] {
+                if let proc_macro2::TokenTree::Literal(lit) = &exp[2] {
                     let action = lit.to_string().replace('"', "");
                     self.commits.insert(action, func.sig.ident.to_string());
                 } else {
@@ -89,13 +87,28 @@ impl VisitMut for CanisterVisitor {
 }
 
 #[proc_macro_attribute]
-pub fn exchange(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn exchange(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut input_mod = parse_macro_input!(item as ItemMod);
     let mut visitor = CanisterVisitor::new();
     visitor.visit_item_mod_mut(&mut input_mod);
     if visitor.pools.is_none() {
-        panic!("Pools not found");
+        panic!("#[pools] not found within the exchange mod");
     }
+    let testnet = attr
+        .into_iter()
+        .filter_map(|a| match a {
+            proc_macro::TokenTree::Ident(ident) if ident.to_string() == "testnet" => {
+                Some(ident.clone())
+            }
+            _ => None,
+        })
+        .next()
+        .is_some();
+    let testnet = if testnet {
+        quote! { true }
+    } else {
+        quote! { false }
+    };
     let pools = visitor.pools.clone().unwrap();
     if let Some((_, ref mut items)) = input_mod.content {
         let branch = visitor
@@ -113,17 +126,27 @@ pub fn exchange(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     self::CURRENT_POOLS.with_borrow(|p| p.get(addr.as_ref()))
                 }
 
-                pub(crate) fn save_pool(pool: #pools::Pool) {
+                pub(crate) fn save(pool: #pools::Pool) {
                     self::CURRENT_POOLS.with_borrow_mut(|p| {
                         p.insert(pool.address.clone(), pool);
                     });
                 }
             }
+            // TODO
         });
 
         items.push(parse_quote! {
             #[::ic_cdk::update]
             pub async fn execute_tx(args: ::ree_types::exchange_interfaces::ExecuteTxArgs) -> ::core::result::Result<String, String> {
+                let orchestrator = if #testnet {
+                    <::candid::Principal as std::str::FromStr>::from_str("hvyp5-5yaaa-aaaao-qjxha-cai").unwrap()
+                } else {
+                    <::candid::Principal as std::str::FromStr>::from_str("kqs64-paaaa-aaaar-qamza-cai").unwrap()
+                };
+                (::ic_cdk::caller() == orchestrator).then(|| ()).ok_or(::core::result::Result::<String, String>::Err(
+                    "Only Orchestrator can call this function".to_string(),
+                ))?;
+
                 let ::ree_types::exchange_interfaces::ExecuteTxArgs {
                     psbt_hex,
                     txid,
@@ -193,7 +216,14 @@ pub fn exchange(_attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn rollback_tx(
                 args: ::ree_types::exchange_interfaces::RollbackTxArgs,
             ) -> ::ree_types::exchange_interfaces::RollbackTxResponse {
-                // TODO ensure Orchestrator
+                let orchestrator = if #testnet {
+                    <::candid::Principal as std::str::FromStr>::from_str("hvyp5-5yaaa-aaaao-qjxha-cai").unwrap()
+                } else {
+                    <::candid::Principal as std::str::FromStr>::from_str("kqs64-paaaa-aaaar-qamza-cai").unwrap()
+                };
+                (::ic_cdk::caller() == orchestrator).then(|| ()).ok_or(::core::result::Result::<String, String>::Err(
+                    "Only Orchestrator can call this function".to_string(),
+                ))?;
                 self::TX_RECORDS.with_borrow_mut(|transactions| {
                     self::CURRENT_POOLS.with_borrow_mut(|pools| {
                         ::ree_types::reorg::rollback_tx(transactions, pools, args)
@@ -207,7 +237,14 @@ pub fn exchange(_attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn new_block(
                 args: ::ree_types::exchange_interfaces::NewBlockArgs,
             ) -> ::ree_types::exchange_interfaces::NewBlockResponse {
-                // TODO ensure Orchestrator
+                let orchestrator = if #testnet {
+                    <::candid::Principal as std::str::FromStr>::from_str("hvyp5-5yaaa-aaaao-qjxha-cai").unwrap()
+                } else {
+                    <::candid::Principal as std::str::FromStr>::from_str("kqs64-paaaa-aaaar-qamza-cai").unwrap()
+                };
+                (::ic_cdk::caller() == orchestrator).then(|| ()).ok_or(::core::result::Result::<String, String>::Err(
+                    "Only Orchestrator can call this function".to_string(),
+                ))?;
                 self::TX_RECORDS.with_borrow_mut(|transactions| {
                     self::CURRENT_POOLS.with_borrow_mut(|pools| {
                         self::BLOCKS.with_borrow_mut(|blocks| {
@@ -215,7 +252,7 @@ pub fn exchange(_attr: TokenStream, item: TokenStream) -> TokenStream {
                                 blocks,
                                 transactions,
                                 pools,
-                                10, // TODO: make this configurable
+                                <#pools as ::ree_types::exchange_interfaces::Pools>::finalize_threshold(),
                                 args
                             )
                         })
@@ -243,7 +280,7 @@ pub fn exchange(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     >
                 > = ::core::cell::RefCell::new(
                     ::ic_stable_structures::StableBTreeMap::init(
-                        MEMORY_MANAGER.with(|m| m.borrow().get(::ic_stable_structures::memory_manager::MemoryId::new(0))),
+                        MEMORY_MANAGER.with(|m| m.borrow().get(::ic_stable_structures::memory_manager::MemoryId::new(100))),
                     )
                 );
                 static TX_RECORDS: ::core::cell::RefCell<
@@ -254,7 +291,7 @@ pub fn exchange(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     >
                 > = ::core::cell::RefCell::new(
                     ::ic_stable_structures::StableBTreeMap::init(
-                        MEMORY_MANAGER.with(|m| m.borrow().get(::ic_stable_structures::memory_manager::MemoryId::new(0))),
+                        MEMORY_MANAGER.with(|m| m.borrow().get(::ic_stable_structures::memory_manager::MemoryId::new(101))),
                     )
                 );
                 static CURRENT_POOLS: ::core::cell::RefCell<
@@ -276,43 +313,6 @@ pub fn exchange(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
     .into()
 }
-
-// #[proc_macro_attribute]
-// pub fn inquiry(attr: TokenStream, item: TokenStream) -> TokenStream {
-//     let mut exp = attr
-//         .into_iter()
-//         .filter_map(|t| match t {
-//             TokenTree::Ident(ident) => Some(ident.to_string()),
-//             TokenTree::Literal(lit) => Some(lit.to_string().replace('"', "")),
-//             _ => None,
-//         })
-//         .collect::<Vec<_>>();
-//     exp.reverse();
-//     while let Some(t) = exp.pop() {
-//         match t.as_str() {
-//             "method" => {
-//                 let method = exp
-//                     .pop()
-//                     .expect("Expected method name after 'method' keyword");
-//                 if method != "query" && method != "update" {
-//                     panic!("Invalid method name in inquiry macro: {}", method);
-//                 }
-//                 let method = quote! {
-//                     #method
-//                 };
-//                 let item: TokenStream2 = item.into();
-//                 let block: TokenStream2 = quote! {
-//                     #[::ic_cdk::#method]
-//                     item
-//                 }
-//                 .into();
-//                 return block.into();
-//             }
-//             _ => {}
-//         }
-//     }
-//     panic!("Expected #[inquiry(method = ..., action = \"..\")] attribute");
-// }
 
 #[proc_macro_attribute]
 pub fn commit(_attr: TokenStream, item: TokenStream) -> TokenStream {
