@@ -104,10 +104,10 @@ pub fn exchange(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .next()
         .is_some();
-    let testnet = if testnet {
-        quote! { true }
+    let authentication = if testnet {
+        quote! {  <::candid::Principal as std::str::FromStr>::from_str("hvyp5-5yaaa-aaaao-qjxha-cai").unwrap() }
     } else {
-        quote! { false }
+        quote! {  <::candid::Principal as std::str::FromStr>::from_str("kqs64-paaaa-aaaar-qamza-cai").unwrap() }
     };
     let pools = visitor.pools.clone().unwrap();
     if let Some((_, ref mut items)) = input_mod.content {
@@ -122,30 +122,39 @@ pub fn exchange(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         items.push(parse_quote! {
             impl #pools {
-                pub(crate) fn pool(addr: impl ::std::convert::AsRef<str>) -> Option<#pools::Pool> {
-                    self::CURRENT_POOLS.with_borrow(|p| p.get(addr.as_ref()))
+                pub fn orchestrator() -> ::candid::Principal {
+                    #authentication
+                }
+            }
+        });
+
+        items.push(parse_quote! {
+            impl ::ree_types::exchange_interfaces::PoolStorage<#pools> for #pools {
+                fn pool(address: &String) -> Option<<#pools as ::ree_types::exchange_interfaces::Pools>::Pool> {
+                    self::CURRENT_POOLS.with_borrow(|p| p.get(address))
                 }
 
-                pub(crate) fn save(pool: #pools::Pool) {
+                fn put(pool: <#pools as ::ree_types::exchange_interfaces::Pools>::Pool) {
                     self::CURRENT_POOLS.with_borrow_mut(|p| {
                         p.insert(pool.address.clone(), pool);
                     });
                 }
+
+                fn remove(address: &String) {
+                    self::CURRENT_POOLS.with_borrow_mut(|p| {
+                        p.remove(address);
+                    });
+                }
             }
-            // TODO
         });
 
         items.push(parse_quote! {
             #[::ic_cdk::update]
             pub async fn execute_tx(args: ::ree_types::exchange_interfaces::ExecuteTxArgs) -> ::core::result::Result<String, String> {
-                let orchestrator = if #testnet {
-                    <::candid::Principal as std::str::FromStr>::from_str("hvyp5-5yaaa-aaaao-qjxha-cai").unwrap()
-                } else {
-                    <::candid::Principal as std::str::FromStr>::from_str("kqs64-paaaa-aaaar-qamza-cai").unwrap()
-                };
-                (::ic_cdk::caller() == orchestrator).then(|| ()).ok_or(::core::result::Result::<String, String>::Err(
-                    "Only Orchestrator can call this function".to_string(),
-                ))?;
+                let orchestrator = #pools::orchestrator();
+                (::ic_cdk::caller() == orchestrator)
+                    .then(|| ())
+                    .ok_or("Only Orchestrator can call this function".to_string())?;
 
                 let ::ree_types::exchange_interfaces::ExecuteTxArgs {
                     psbt_hex,
@@ -164,24 +173,34 @@ pub fn exchange(attr: TokenStream, item: TokenStream) -> TokenStream {
                     pool_utxo_received,
                     input_coins,
                     output_coins,
-                } = intention_set[intention_index as usize];
+                } = &intention_set.intentions[intention_index as usize];
                 let __pool_address = pool_address.clone();
                 let __txid = txid.clone();
                 let __action = action.clone();
+                let args = ::ree_types::exchange_interfaces::ExecuteTxArgs {
+                    psbt_hex,
+                    txid,
+                    intention_set,
+                    intention_index,
+                    zero_confirmed_tx_queue_length,
+                };
                 let __result = match __action.as_str() {
                     #(#branch)*
                     _ => ::core::result::Result::<String, String>::Err(format!("Unknown action: {}", __action)),
                 };
-                if let ::core::result::Result::Err(__e) = __result {
-                    return ::core::result::Result::<String, String>::Err(__e);
-                }
-                self::TX_RECORDS.with_borrow_mut(|m| {
-                    let mut __record = m.get(&(__txid.clone(), false)).unwrap_or_default();
-                    if !__record.pools.contains(&__pool_address) {
-                        __record.pools.push(__pool_address.clone());
+                match __result {
+                    ::core::result::Result::Ok(r) => {
+                        self::TX_RECORDS.with_borrow_mut(|m| {
+                            let mut __record = m.get(&(__txid.clone(), false)).unwrap_or_default();
+                            if !__record.pools.contains(&__pool_address) {
+                                __record.pools.push(__pool_address.clone());
+                            }
+                            m.insert((__txid.clone(), false), __record);
+                        });
+                        ::core::result::Result::<String, String>::Ok(r)
                     }
-                    m.insert((__txid.clone(), false), __record);
-                });
+                    ::core::result::Result::Err(e) => ::core::result::Result::<String, String>::Err(e),
+                }
             }
         });
 
@@ -191,7 +210,7 @@ pub fn exchange(attr: TokenStream, item: TokenStream) -> TokenStream {
                 self::CURRENT_POOLS.with_borrow(|p| {
                     p.iter()
                         .map(|(_id, p)| {
-                            <#pools::Pool as ::ree_types::exchange_interfaces::ReePool>::get_basic_info(p)
+                            <<#pools as ::ree_types::exchange_interfaces::Pools>::Pool as ::ree_types::exchange_interfaces::ReePool>::get_basic_info(&p)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -205,7 +224,7 @@ pub fn exchange(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> ::ree_types::exchange_interfaces::GetPoolInfoResponse {
                 self::CURRENT_POOLS.with_borrow(|p| {
                     p.get(&args.pool_address).map(|pool| {
-                        <#pools::Pool as ::ree_types::exchange_interfaces::ReePool>::get_pool_info(pool)
+                        <<#pools as ::ree_types::exchange_interfaces::Pools>::Pool as ::ree_types::exchange_interfaces::ReePool>::get_pool_info(&pool)
                     })
                 })
             }
@@ -216,14 +235,10 @@ pub fn exchange(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn rollback_tx(
                 args: ::ree_types::exchange_interfaces::RollbackTxArgs,
             ) -> ::ree_types::exchange_interfaces::RollbackTxResponse {
-                let orchestrator = if #testnet {
-                    <::candid::Principal as std::str::FromStr>::from_str("hvyp5-5yaaa-aaaao-qjxha-cai").unwrap()
-                } else {
-                    <::candid::Principal as std::str::FromStr>::from_str("kqs64-paaaa-aaaar-qamza-cai").unwrap()
-                };
-                (::ic_cdk::caller() == orchestrator).then(|| ()).ok_or(::core::result::Result::<String, String>::Err(
-                    "Only Orchestrator can call this function".to_string(),
-                ))?;
+                let orchestrator = #pools::orchestrator();
+                (::ic_cdk::caller() == orchestrator)
+                    .then(|| ())
+                    .ok_or("Only Orchestrator can call this function".to_string())?;
                 self::TX_RECORDS.with_borrow_mut(|transactions| {
                     self::CURRENT_POOLS.with_borrow_mut(|pools| {
                         ::ree_types::reorg::rollback_tx(transactions, pools, args)
@@ -237,14 +252,10 @@ pub fn exchange(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn new_block(
                 args: ::ree_types::exchange_interfaces::NewBlockArgs,
             ) -> ::ree_types::exchange_interfaces::NewBlockResponse {
-                let orchestrator = if #testnet {
-                    <::candid::Principal as std::str::FromStr>::from_str("hvyp5-5yaaa-aaaao-qjxha-cai").unwrap()
-                } else {
-                    <::candid::Principal as std::str::FromStr>::from_str("kqs64-paaaa-aaaar-qamza-cai").unwrap()
-                };
-                (::ic_cdk::caller() == orchestrator).then(|| ()).ok_or(::core::result::Result::<String, String>::Err(
-                    "Only Orchestrator can call this function".to_string(),
-                ))?;
+                let orchestrator = #pools::orchestrator();
+                (::ic_cdk::caller() == orchestrator)
+                    .then(|| ())
+                    .ok_or("Only Orchestrator can call this function".to_string())?;
                 self::TX_RECORDS.with_borrow_mut(|transactions| {
                     self::CURRENT_POOLS.with_borrow_mut(|pools| {
                         self::BLOCKS.with_borrow_mut(|blocks| {
@@ -297,7 +308,7 @@ pub fn exchange(attr: TokenStream, item: TokenStream) -> TokenStream {
                 static CURRENT_POOLS: ::core::cell::RefCell<
                     ::ic_stable_structures::StableBTreeMap<
                         ::std::string::String,
-                        #pools::Pool,
+                        <#pools as ::ree_types::exchange_interfaces::Pools>::Pool,
                         ::ic_stable_structures::memory_manager::VirtualMemory<::ic_stable_structures::DefaultMemoryImpl>
                     >
                 > = ::core::cell::RefCell::new(
