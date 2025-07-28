@@ -8,7 +8,7 @@ use syn::{
 
 #[derive(Clone)]
 struct CanisterVisitor {
-    commits: BTreeMap<String, String>,
+    commits: BTreeMap<String, (String, bool)>,
     pools: Option<Ident>,
 }
 
@@ -37,17 +37,25 @@ impl CanisterVisitor {
             return;
         }
         if let Meta::Path(_) = &attr.meta {
-            self.commits
-                .insert(func.sig.ident.to_string(), func.sig.ident.to_string());
+            self.commits.insert(
+                func.sig.ident.to_string(),
+                (func.sig.ident.to_string(), func.sig.asyncness.is_some()),
+            );
         } else if let Meta::List(meta_list) = &attr.meta {
             let exp = meta_list.tokens.clone().into_iter().collect::<Vec<_>>();
             if exp.is_empty() {
-                self.commits
-                    .insert(func.sig.ident.to_string(), func.sig.ident.to_string());
+                let action = func.sig.ident.to_string();
+                self.commits.insert(
+                    action,
+                    (func.sig.ident.to_string(), func.sig.asyncness.is_some()),
+                );
             } else if exp.len() == 1 {
                 if let proc_macro2::TokenTree::Literal(lit) = &exp[0] {
                     let action = lit.to_string().replace('"', "");
-                    self.commits.insert(action, func.sig.ident.to_string());
+                    self.commits.insert(
+                        action,
+                        (func.sig.ident.to_string(), func.sig.asyncness.is_some()),
+                    );
                 } else {
                     panic!("Expected #[commit(\"...\")] attribute");
                 }
@@ -59,7 +67,10 @@ impl CanisterVisitor {
                 }
                 if let proc_macro2::TokenTree::Literal(lit) = &exp[2] {
                     let action = lit.to_string().replace('"', "");
-                    self.commits.insert(action, func.sig.ident.to_string());
+                    self.commits.insert(
+                        action,
+                        (func.sig.ident.to_string(), func.sig.asyncness.is_some()),
+                    );
                 } else {
                     panic!("Expected #[commit(action = \"...\")] attribute");
                 }
@@ -114,9 +125,13 @@ pub fn exchange(attr: TokenStream, item: TokenStream) -> TokenStream {
         let branch = visitor
             .commits
             .iter()
-            .map(|(k, v)| {
-                let call = format_ident!("{}", v);
-                quote! { #k => #call(args), }
+            .map(|(action, (func, is_async))| {
+                let call = format_ident!("{}", func);
+                if *is_async {
+                    quote! { #action => #call(args).await, }
+                } else {
+                    quote! { #action => #call(args), }
+                }
             })
             .collect::<Vec<_>>();
 
@@ -130,17 +145,17 @@ pub fn exchange(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         items.push(parse_quote! {
             impl ::ree_types::exchange_interfaces::PoolStorage<#pools> for #pools {
-                fn pool(address: &String) -> Option<<#pools as ::ree_types::exchange_interfaces::Pools>::Pool> {
+                fn pool(address: &::std::string::String) -> Option<<#pools as ::ree_types::exchange_interfaces::Pools>::Pool> {
                     self::CURRENT_POOLS.with_borrow(|p| p.get(address))
                 }
 
-                fn put(pool: <#pools as ::ree_types::exchange_interfaces::Pools>::Pool) {
+                fn put(address: ::std::string::String, pool: <#pools as ::ree_types::exchange_interfaces::Pools>::Pool) {
                     self::CURRENT_POOLS.with_borrow_mut(|p| {
-                        p.insert(pool.address.clone(), pool);
+                        p.insert(address, pool);
                     });
                 }
 
-                fn remove(address: &String) {
+                fn remove(address: &::std::string::String) {
                     self::CURRENT_POOLS.with_borrow_mut(|p| {
                         p.remove(address);
                     });
